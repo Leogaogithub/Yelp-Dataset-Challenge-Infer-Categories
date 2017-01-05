@@ -1,0 +1,153 @@
+//https://spark.apache.org/docs/1.6.0/sql-programming-guide.html
+//https://jaceklaskowski.gitbooks.io/mastering-apache-spark/content/spark-sql-sparksession.html
+//Load the business data
+val spark = new org.apache.spark.sql.SQLContext(sc)
+// this is used to implicitly convert an RDD to a DataFrame.
+import sqlContext.implicits._
+
+
+val busdf = spark.read.json("hdfs://namenode:9000/pro/yelp_academic_dataset_business.json")
+busdf.createOrReplaceTempView("bus")                
+
+//Find out all Chinese Restaurant  
+val chinese = spark.sql("SELECT business_id FROM bus WHERE categories[0] LIKE '%Chinese%' OR categories[1] LIKE '%Chinese%' OR categories[2] LIKE '%Chinese%'")
+chinese.createOrReplaceTempView("chi")            
+
+//Load the tip data 
+val tipdf = spark.read.json("hdfs://namenode:9000/pro/yelp_academic_dataset_tip.json")
+tipdf.createOrReplaceTempView("tip")               
+
+//Load the review data 
+val reviewdf = spark.read.json("hdfs://namenode:9000/pro/yelp_academic_dataset_review.json")
+reviewdf.createOrReplaceTempView("review")            
+
+//LEFT-JOIN tip 
+val tips_id = spark.sql("SELECT chi.business_id,tip.text FROM chi LEFT JOIN tip ON chi.business_id = tip.business_id").filter("text!=null")
+tips_id.show()                                      
+
+//LEFT-JOIN review 
+val review_id = spark.sql("SELECT chi.business_id,review.text FROM chi LEFT JOIN review ON chi.business_id = review.business_id").filter("text!=null")
+review_id.show()                                      
+
+//Union the tip and review text and format the data
+val all = review_id.unionAll(tips_id)
+val all_formatted = all.map(t =>  "\""+t(0)+"\"#\""+escapeJava(t(1))+"\"")
+
+//Output as the Chinese_review.txt　coalesce to 1 partition.
+all_formatted.rdd.coalesce(1).saveAsTextFile("hdfs://namenode:9000/pro/Chinese_review.txt")
+
+def check(a:String):String = { 
+val fields = a.split("\"#\"")
+val id = fields(0).substring(1)
+val review = fields(1).substring(0,fields(1).length()-1)
+var b=review.toLowerCase
+if(b.contains("sezechuan")||b.contains("sichuan")){
+return "\""+id+"\"#\""+"Sezechuan\""
+}else if(b.contains("hunan")){
+return "\""+id+"\"#\""+"Hunan\""
+}else if(b.contains("cantonese")||b.contains("hongkong")){
+return "\""+id+"\"#\""+"Cantonese\""
+}else if(b.contains("dongbei")){
+return "\""+id+"\"#\""+"Dongbei\""
+}else if(b.contains("Taiwan")){
+return "\""+id+"\"#\""+"Taiwan\""
+}else{
+return "\""+id+"\""
+}
+}
+
+//Load the Chinese_review.txt
+val tf=sc.textFile("hdfs://namenode:9000/pro/Chinese_review.txt/part-00000")
+
+//Label all the data
+val line=tf.map(l=>check(l))
+
+//Find out all the data with right catagory
+val line2=line.filter(l=>l.contains("#"))
+
+//Find out all the data without right catagory
+val line3=line.filter(l=>(!l.contains("#")))
+
+//Ouput the labeled_business_id.txt and unlabeled_business_id.txt
+line2.coalesce(1).saveAsTextFile("hdfs://namenode:9000/pro/labeled_business_id.txt")
+line3.coalesce(1).saveAsTextFile("hdfs://namenode:9000/pro/unlabeled_business_id.txt")
+
+case class Review(id: String, review: String)
+case class Labeled_id(id: String, categories: String)
+
+def parseReview(str: String): Review = {
+  val fields = str.split("\"#\"")
+  val id = fields(0).substring(1)
+  val review = fields(1).substring(0,fields(1).length()-1)
+  Review(id,review)
+}
+def parseLabeled(str: String): Labeled_id = {
+  val fields = str.split("\"#\"")
+  val id = fields(0).substring(1)
+  val categories = fields(1).substring(0,fields(1).length()-1)
+  Labeled_id(id,categories)
+}
+
+//prepare review text data
+val review_data = spark.read.textFile("hdfs://namenode:9000/pro/Chinese_review.txt/part-00000")
+val review_df = review_data.map(parseReview).toDF()
+val labeled_id_data = spark.read.textFile("hdfs://namenode:9000/pro/labeled_business_id.txt/part-00000")
+val labeled_id_df = labeled_id_data.map(parseLabeled).toDF()
+
+val labeled_data = labeled_id_df.join(review_df, Seq("id") )
+
+// Give double type labels 
+val categories_to_label = udf[Double,String]{ (categories) =>
+val label = categories match{
+case "Sezechuan" => 1.0 case "Hunan" => 2.0 case "Cantonese" => 3.0 case "Dongbei" => 4.0 case "Taiwan" => 5.0
+}
+label
+}
+
+val new_labeled_data = labeled_data.withColumn("label", categories_to_label($"categories")).cache
+
+//Divide data into training data and test data 75% : 25%
+val Array(trainDF, testDF) = new_labeled_data.randomSplit(Array(0.75, 0.25))
+
+//Prepare the pipeline 
+
+//TF method
+import org.apache.spark.ml.feature.RegexTokenizer
+val tokenizer = new RegexTokenizer().setInputCol("review").setOutputCol("words")
+import org.apache.spark.ml.feature.HashingTF
+val hashingTF = new HashingTF().setInputCol(tokenizer.getOutputCol).setOutputCol("features").setNumFeatures(5000)
+
+// OneVsRest (Logistic Regression)
+import org.apache.spark.ml.classification.{LogisticRegression, OneVsRest}
+val lr = new LogisticRegression().setMaxIter(100).setRegParam(0.01)
+val ovr = new OneVsRest().setClassifier(lr)
+
+// Neural network model
+import org.apache.spark.ml.classification.MultilayerPerceptronClassifier
+val layers = Array[Int](5000, 5, 4, 5)
+val nn = new MultilayerPerceptronClassifier().setLayers(layers).setBlockSize(128).setSeed(1234L).setMaxIter(100)
+  
+import org.apache.spark.ml.Pipeline
+val pipeline2 = new Pipeline().setStages(Array(tokenizer, hashingTF, ovr))
+val pipeline3 = new Pipeline().setStages(Array(tokenizer, hashingTF, nn))
+
+
+// model 
+val model2 = pipeline2.fit(trainDF)
+val trainPredictions2 = model2.transform(trainDF)
+val testPredictions2 = model2.transform(testDF)
+
+val model3 = pipeline3.fit(trainDF)
+val trainPredictions3 = model3.transform(trainDF)
+val testPredictions3 = model3.transform(testDF)
+
+trainPredictions.select('id, 'topic, 'text, 'label, 'prediction).show
+
+// Calculate the accuracy 
+val correct:Double = testPredictions2.filter("label == prediction").count()
+val all:Double = testPredictions2.count
+val correct_rate = correct/all
+
+val correct:Double = testPredictions3.filter("label == prediction").count()
+val all:Double = testPredictions3.count
+val correct_rate = correct/all 
